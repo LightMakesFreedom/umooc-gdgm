@@ -1,0 +1,14 @@
+# 账号密码与会话——绝不入库
+config.json
+scripts/session.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 系统杂物
+.DS_Store
+Thumbs.db
+desktop.ini
