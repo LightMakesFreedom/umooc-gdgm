@@ -1,0 +1,7 @@
+{
+  "_说明": "优慕课(广东工贸 THEOL)账号。复制本文件为 config.json 后填入真实值;config.json 只存本机,不要提交到 git。",
+  "username": "你的学号",
+  "password": "你的密码",
+  "um": "你的um(见下方说明)",
+  "_um说明": "um = 学号在平台内的用户ID,每账号不同。来自 viewstudent_info.jsp?SID= 或课程详情页 uid="
+}
