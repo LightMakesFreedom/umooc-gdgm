@@ -14,7 +14,7 @@
 判定"已交"的硬标准: 有分数 mark 或 有 finishTime。
   ⚠️ submitStruts 是"提交窗口还开着",不是"已提交"! 拿它判断会报一堆乌龙。
 """
-import sys, os, json, re, html, urllib.parse, urllib.request, http.cookiejar, ssl, datetime
+import sys, os, json, re, html, urllib.parse, urllib.request, http.cookiejar, http.client, ssl, datetime
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SITE = "https://umooc.gdgm.cn"
@@ -27,6 +27,48 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0")
 SEM_START = "2026-09-01"      # 本学期(2026-2027-1)起点,之前算历史存量
 
+# ---------------------------------------------------------------- DNS 兜底
+# 本机 DNS 曾被污染: umooc.gdgm.cn 解析成 172.28.166.60(Clash TUN 的假地址),
+# 连进去直接 "Remote end closed connection",看起来像被封号,其实是连不上。
+# 公共 DNS(223.5.5.5 / 119.29.29.29)一直给的是真地址。这里做兜底:
+# 环境变量 UMOOC_HOSTIP 显式指定优先;否则系统解析出私网地址(10./172.16-31./192.168.)
+# 时才去查公共 DNS 换掉。真地址变了一般也不影响——改 UMOOC_HOSTIP 即可。
+def _is_private(ip):
+    p = ip.split(".")
+    if len(p) != 4 or not all(x.isdigit() for x in p):
+        return False
+    a, b = int(p[0]), int(p[1])
+    return a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168)
+
+
+def resolve_site():
+    """返回 (真实IP 或 None)。None 表示用系统默认解析。"""
+    host = urllib.parse.urlparse(SITE).hostname
+    forced = (os.environ.get("UMOOC_HOSTIP") or "").strip()
+    if forced:
+        return forced
+    import socket
+    try:
+        ip = socket.gethostbyname(host)
+    except Exception:
+        ip = ""
+    if ip and not _is_private(ip):
+        return None
+    # 解析失败或是私网地址 -> 问公共 DNS(nslookup 输出可能是 GBK,两种都试)
+    for dns in ("223.5.5.5", "119.29.29.29"):
+        try:
+            r = __import__("subprocess").run(
+                ["nslookup", host, dns], capture_output=True, timeout=10)
+            raw = r.stdout or b""
+            txt = raw.decode("utf-8", "replace") + raw.decode("gb18030", "replace")
+            ips = re.findall(r"Address(?:es)?:\s*((?:\d{1,3}\.){3}\d{1,3})", txt)
+            ips = [x for x in ips if x != dns and not _is_private(x)]
+            if ips:
+                return ips[-1]
+        except Exception:
+            continue
+    return None
+
 # ponytail: courseId 写死。平台只给"有作业的课"的列表,新增课程手动加一行,
 # 或跑 --courses 重新抓。漏一门课就可能漏一堆作业,所以默认会跟首页组件交叉校验。
 # ↓ 占位示例:首次使用先跑 `python 查作业.py --courses`,把生成的 COURSES 行贴回来
@@ -34,6 +76,15 @@ COURSES = {
     11111: "示例课程A(换成你的)",
     22222: "示例课程B(换成你的)",
 }
+
+# 本机覆盖:config.json 里写 "courses": {"19808": "程序设计基础", ...} 就覆盖上面的占位,
+# 这样 git pull 更新技能时不会和本地课表冲突。
+try:
+    _cfgcourses = json.load(open(CFG, encoding="utf-8")).get("courses")
+    if _cfgcourses:
+        COURSES = {int(k): v for k, v in _cfgcourses.items()}
+except Exception:
+    pass
 
 
 # ---------------------------------------------------------------- 会话
@@ -65,10 +116,32 @@ def new_opener():
         except Exception:
             pass
     # ProxyHandler({}) 必须的:系统代理会缓存页面,拿到过期 token
-    return urllib.request.build_opener(
-        urllib.request.ProxyHandler({}),
-        urllib.request.HTTPCookieProcessor(cj),
-        urllib.request.HTTPSHandler(context=ctx)), cj
+    handlers = [urllib.request.ProxyHandler({}),
+                urllib.request.HTTPCookieProcessor(cj),
+                urllib.request.HTTPSHandler(context=ctx)]
+    # DNS 被污染时,把域名钉到解析出来的真 IP(见上面 resolve_site)。
+    # 实测结论(Python 3.14):
+    #   - HTTPSConnection 不支持 server_hostname 参数 → 别用
+    #   - 服务器**不吃 SNI**(SNI 填 IP 照样 302),所以不需要伪造 SNI
+    #   - 唯一必须的是 Host 头保持原域名,否则虚拟主机匹配不到
+    # 做法: 连 IP,Host 头由 urllib 按原 URL 自动带上(它不会因为换了连接就丢 Host)。
+    global _PIN_IP
+    _PIN_IP = resolve_site()
+    if _PIN_IP:
+        site_host = urllib.parse.urlparse(SITE).hostname
+
+        class _Conn(http.client.HTTPSConnection):
+            def __init__(self, host, **kw):
+                kw.pop("context", None)
+                http.client.HTTPSConnection.__init__(self, _PIN_IP, context=ctx, **kw)
+
+        class _Handler(urllib.request.HTTPSHandler):
+            def https_open(self, req):
+                return self.do_open(_Conn, req, context=ctx)
+
+        handlers.append(_Handler())
+        print("[i] DNS 兜底: %s -> %s" % (site_host, _PIN_IP))
+    return urllib.request.build_opener(*handlers), cj
 
 
 def save_cookies(cj):
@@ -100,12 +173,18 @@ def dec(b):
 
 
 def session_alive(op):
-    """已登录的 personal.do 是大页面;未登录返回 782 字节的'您尚未登录系统'"""
+    """已登录的 personal.do 是大页面;未登录返回 782 字节的'您尚未登录系统'。
+
+    返回值: True=活着 / False=确实过期(该重登) / None=网络异常(别重登!)
+    ⚠️ 这里曾把网络异常也当成"过期"→ 每次抖动都白登一次 → 撞并发上限被封几小时。
+    网络错就报错退出让用户重跑,绝不能拿"可能过期"当"确定过期"。
+    """
     try:
         _, b = fetch(op, SITE + "/meol/personal.do", timeout=25)
-        return len(b) > 3000 and "尚未登录" not in dec(b)
-    except Exception:
-        return False
+    except Exception as e:
+        print("[!] 会话探测失败(网络问题,不是登录过期): %s" % e)
+        return None
+    return len(b) > 3000 and "尚未登录" not in dec(b)
 
 
 def login(op, cj):
@@ -126,7 +205,10 @@ def login(op, cj):
 
 def session():
     op, cj = new_opener()
-    if not session_alive(op):
+    alive = session_alive(op)
+    if alive is None:
+        sys.exit("网络不通,已中止(没有重登,避免撞并发上限)。稍后重试。")
+    if not alive:
         login(op, cj)
         print("(会话已过期,已重新登录)")
     return op

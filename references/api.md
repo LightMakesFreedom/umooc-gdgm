@@ -86,6 +86,81 @@ THEOL V8(优慕课)平台,学生侧。所有接口都要带 `/meol` 前缀(直�
 作业模块入口:`/meol/common/hw/go_to_newhw.jsp?tagbug=&hwType=blended_info&hwtid=Z&strStyle=new03`
 → 该页写 localStorage(role/courseId/token/rootUrl)后跳 `/meol/common/homework.html`(Vue SPA,HTML 是空壳)
 
+## 课程资料(文件/课件/教材,2026-11-15 实测)
+
+### 解析链: 课程 → 栏目 → 资源 → 文件
+
+| 步骤 | 端点 | 说明 |
+|---|---|---|
+| 1. 栏目树 | `GET /meol/jpk/course/layout/newpage/index.jsp?courseId=X` | 56KB HTML,从 `course_column_preview_transfer.jsp?...columnId=NNN"> <span>栏目名</span>` 正则提取。**同一 columnId 会出现多次**(不同分组下的别名,如 323001 既叫"课程练习题"又叫"理论练习题") |
+| 2. 栏目跳转 | `GET /meol/jpk/course/course_column_preview_transfer.jsp?tagbug=client&columnId=NNN` | 28 字节空壳或跳转页。要顺着自身重定向看最终 URL,得到真实视图端点 |
+| 3a. 资源文件夹 | 跳到 `/meol/buildless/colUrlStuView.do?columnId=NNN` → 内含 `<iframe src=".../resFolderViewList.do?folderid=..&lid=..&columnId=..">` | 多文件列表型(上课文档/练习题/章节) |
+| 3b. 课程资源树 | 跳到 `/meol/common/script/courseResource.jsp?tagbug=client&folderid=0&lid=X&groupid=4` | 独立目录树,内部两个 iframe: `left.jsp`(目录树,JS 异步拉,静态 HTML 拿不到) + `listview.jsp?groupid=4&lid=X&folderid=N`(文件列表) |
+| 4. 文件列表 | `GET /meol/buildless/resFolderViewList.do?folderid=F&lid=X&columnId=N` | 见下方"两种页面形态" |
+| 5. 下载 | `GET /meol/common/script/download.jsp?fileid=FID&resid=RID&lid=X` | **唯一通用下载端点**,见下 |
+
+### 两种文件列表页面形态(都要认)
+
+**形态 A:多文件列表**(64KB 页,最常见)
+```html
+<img src="/meol/common/icons/pdf.gif">&nbsp;
+<a href=" /meol/common/script/preview/download_preview.jsp?fileid=4759072&resid=292840&lid=19498&preview=preview ">课程成绩评定标准</a>
+```
+正则要用 `<a[^>]*href="\s*(...download_preview\.jsp...)"[^>]*>([^<]*)</a>` —— **href 前后带空格和换行**,不能用紧贴的 `href="`。
+
+**形态 B:单文件详情页**(章节栏目一栏目挂一个资源)
+```html
+<h1>第1章 程序设计和C语言（含算法）</h1>
+<h2>文件名:第1章 程序设计和C语言（含算法）.pdf <span>(3.0M)</span>
+    <a class="icon32 lv-download" href="/meol/common/script/download.jsp?fileid=2182951&resid=169658">下载</a></h2>
+```
+没有图标列表,页内只有一个 `download.jsp` 链接。**若只按形态 A 解析会漏掉整门课** —— 程序设计基础(19808)就是这样,82 个栏目全靠形态 B 才抓到 10 章 PDF。
+
+### 下载端点选择(关键)
+
+| 端点 | PDF | Word/Excel/rar | 结论 |
+|---|---|---|---|
+| `/meol/common/script/download.jsp?fileid=..&resid=..&lid=..` | ⚠️ 返回 777 字节错误页 | ✅ 正常,`Content-Disposition` 带真名 | **统一用它** |
+| `/meol/analytics/resPdfShow.do?resId=..&lid=..` | ✅ 114KB 真 PDF | ❌ **0 字节** | 别用于非 PDF |
+
+- `download.jsp` 对 PDF 失败时,预览页里会额外给 `resPdfShow.do`;反过来不行。
+- 文件名一律从 `Content-Disposition: attachment; filename="..."` 里取(URL 编码,要 `unquote`),比列表标题准(列表标题常没有扩展名)。
+- 实测文件头校验:docx/xlsx = `504b0304`(ZIP),rar = `526172211a0700`(RAR5),PDF = `%PDF-1.5`。
+
+### ⚠️ 错误页检测的坑(2026-11-16 踩过)
+
+`download.jsp` 对某些 PDF 返回 777 字节的错误页(`<link href="/meol/styles/main/css/error.css">`)。
+**这个错误页前面有几十个换行**,所以:
+
+```python
+body[:15].lstrip().startswith(b"<!DOCTYPE")   # ❌ 永远 False,lstrip 后是空串
+(body or b"")[:400].lstrip().lower().startswith(b"<!doctype")   # ✅
+```
+
+判断错了的后果很隐蔽:**777 字节的 HTML 被当成 PDF 存下来**,目录里看着"成功"了,打开才是错的。
+所以判 PDF 还要再看 `body[:4] == b"%PDF"`,对不上就走 `resPdfShow.do` 回退。
+
+### 同名栏目会互相覆盖(2026-11-16 踩过)
+
+`19498` 有**两个都叫"课堂练习题"**的栏目:`340728`(装 txt/zip)和 `328179`(装 docx)。
+如果结果字典用栏目名当 key,后一个会把前一个覆盖掉,**静默丢 4 个文件**,而且不报错。
+现在 key 用 `栏目名#columnId`,目录名只在真重名时才加 columnId 后缀。
+
+反向的坑也要注意:同一 columnId 会有多个别名(323001 既叫"课程练习题"又叫"理论练习题"),
+那种情况必须按 columnId 去重,否则重复下载。
+
+### 图标 → 类型
+
+`icons/pdf.gif` `word.gif` `excel.gif` `ppt.gif` `photo.gif` `text.gif` `zip.gif` `rar.gif` `video.gif`。
+一门课的实测分布:`{rar:9, photo:8, word:93, pdf:101, text:50, zip:1, excel:2}`。
+
+### 坑
+
+- **同 columnId 别名会导致重复拉取**:不去重的话 `--column 323001` 会把 19 个文件下成 38 个(两个栏目名各一份)。必须先按 columnId 去重,文件再按 resid 去重。
+- **栏目页请求很慢**:52 个栏目要 1 分多钟,82 个要 1.5 分钟。加 `UMOOC_GAP`(默认 1 秒)限速,别为求快并发。
+- 没挂资料的课很常见(如 29477 路由与交换技术,8 个栏目全空),不是解析失败。
+- 「课程资源」(courseResource.jsp)那套的目录树由 `left.jsp` 里 JS 异步拉,静态 HTML 拿不到目录结构;只能从 `listview.jsp` 的 `folderid=0` 起 BFS 爬子目录。
+
 ## 内容解析(双层编码)
 
 `content` / `hwaAnswer` 的正文藏在:
@@ -106,3 +181,20 @@ THEOL V8(优慕课)平台,学生侧。所有接口都要带 `/meol` 前缀(直�
   形如 `stu:{hwStuHwtList:function(e){return Object(u["a"])("/hw/stu/hwStuHwtList.do",e)}}`
 - 教师侧接口在 `/hw/tea/*`(hwList/addHwTask/hwUpdateMark 等),本技能不用
 - `urllib` 必须 `ProxyHandler({})`:系统代理会缓存页面拿到过期 token
+
+## DNS 污染(2026-11-15)
+
+本机把 `umooc.gdgm.cn` 解析成 `172.28.166.60`(Clash TUN 网段的假地址),症状:
+
+| 现象 | 真实原因 |
+|---|---|
+| `Remote end closed connection without response` | 连到了不存在的机器,不是封号 |
+| `session_alive()` 返回 False → 反复重登 | 误判会话过期 → 撞并发上限 |
+| `curl` 直连 http=000 | DNS 指错,不是站点挂了 |
+
+正确 IP 由 `223.5.5.5` / `119.29.29.29` 一致给出:**121.32.26.118**。
+`curl --resolve umooc.gdgm.cn:443:121.32.26.118 https://umooc.gdgm.cn/meol/index.do` → **302**(正常)。
+对照:`--resolve ...:172.28.166.60` → `000`(不通)。
+
+`查作业.py` 的 `resolve_site()` 已做兜底(私网地址才替换,公网解析正常时不干预),
+并支持 `UMOOC_HOSTIP` 环境变量强制指定。
